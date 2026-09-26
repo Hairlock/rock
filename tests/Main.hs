@@ -9,6 +9,8 @@
 {-# language TypeFamilies #-}
 module Main where
 
+import Control.Concurrent
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad
 import Control.Monad.Identity
 import Control.Monad.IO.Class
@@ -30,6 +32,7 @@ import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Rock
+import System.Timeout (timeout)
 
 data Key v where
   IntKey :: Int -> Key Int
@@ -144,6 +147,47 @@ prop_memoise_memoises =
 
     fetchedKeys <- liftIO $ readIORef fetchedKeysVar
     fetchedKeys === [Some key_]
+
+-- | A query whose computation dies (here with an exception, as a timeout or
+-- a cancellation would kill it) is computed again by the thread that was
+-- waiting for it, rather than awaited forever.
+prop_waiter_recomputes_after_the_computing_thread_dies :: Property
+prop_waiter_recomputes_after_the_computing_thread_dies =
+  withTests 1 $ property $ do
+    outcomes <- liftIO $ forM [False, True] $ \withCycleDetection -> do
+      attemptsVar <- newIORef (0 :: Int)
+      entered <- newEmptyMVar
+      release <- newEmptyMVar
+      memoVar <- newIORef mempty
+      startedVar <- newIORef mempty
+      depsVar <- newIORef mempty
+      let
+        base :: GenRules Key Key
+        base key_ =
+          case key_ of
+            IntKey _ -> do
+              attempt <- liftIO $ atomicModifyIORef attemptsVar $ \n -> (n + 1, n)
+              when (attempt == 0) $ liftIO $ do
+                putMVar entered ()
+                takeMVar release
+                throwIO $ userError "the computing thread died"
+              pure 42
+            StringKey s ->
+              pure s
+
+        rules :: Rules Key
+        rules
+          | withCycleDetection = memoiseWithCycleDetection startedVar depsVar base
+          | otherwise = memoise memoVar base
+
+      _ <- forkIO $ void $ try @SomeException $ runTask rules $ fetch $ IntKey 1
+      takeMVar entered
+      waited <- newEmptyMVar
+      _ <- forkIO $ putMVar waited =<< try @SomeException (runTask rules $ fetch $ IntKey 1)
+      threadDelay 10000
+      putMVar release ()
+      fmap (either (const Nothing) Just) <$> timeout 5000000 (takeMVar waited)
+    outcomes === [Just (Just 42), Just (Just 42)]
 
 inputRules :: Int -> GenRules (Writer TaskKind Key) Key
 inputRules input (Writer key_) =

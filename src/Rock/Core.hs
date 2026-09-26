@@ -36,7 +36,6 @@ import Data.Constraint.Extras
 import Data.Dependent.HashMap (DHashMap)
 import qualified Data.Dependent.HashMap as DHashMap
 import Data.Dependent.Sum
-import Data.Foldable
 import Data.Functor.Const
 import Data.GADT.Compare (GEq, GCompare, geq, gcompare, GOrdering(..))
 import Data.GADT.Show (GShow)
@@ -170,32 +169,50 @@ trackM f task = do
 --
 -- The 'DHashMap' should typically not be reused if there has been some change that
 -- might make a query return a different result.
+--
+-- A query whose computation ends in an exception (including an asynchronous
+-- one, such as a timeout or a cancellation) is forgotten, and the threads
+-- waiting for it compute it themselves; nothing is left blocked on it.
 memoise
   :: forall f g
   . (GEq f, Hashable (Some f))
-  => IORef (DHashMap f MVar)
+  => IORef (DHashMap f Promise)
   -> GenRules f g
   -> GenRules f g
-memoise startedVar rules (key :: f a) = do
-  maybeValueVar <- DHashMap.lookup key <$> readIORef startedVar
-  case maybeValueVar of
-    Nothing -> do
-      valueVar <- newEmptyMVar
-      join $ atomicModifyIORef startedVar $ \started ->
-        case DHashMap.alterLookup (Just . fromMaybe valueVar) key started of
-          (Nothing, started') ->
-            ( started'
-            , do
-              value <- rules key
-              putMVar valueVar value
-              return value
-            )
+memoise startedVar rules (key :: f a) =
+  mask $ \restore -> do
+    maybePromise <- DHashMap.lookup key <$> readIORef startedVar
+    case maybePromise of
+      Nothing -> do
+        valueVar <- newEmptyMVar
+        join $ atomicModifyIORef startedVar $ \started ->
+          case DHashMap.alterLookup (Just . fromMaybe (Promise valueVar)) key started of
+            (Nothing, started') ->
+              ( started'
+              , do
+                result <- try $ restore $ rules key
+                uninterruptibleMask_ $ case result of
+                  Right value ->
+                    putMVar valueVar $ Just value
+                  Left (_ :: SomeException) -> do
+                    atomicModifyIORef startedVar $ \started'' ->
+                      (DHashMap.delete key started'', ())
+                    putMVar valueVar Nothing
+                either throwIO return result
+              )
 
-          (Just valueVar', _started') ->
-            (started, readMVar valueVar')
+            (Just promise, _started') ->
+              (started, restore $ awaitPromise promise)
 
-    Just valueVar ->
-      readMVar valueVar
+      Just promise ->
+        restore $ awaitPromise promise
+  where
+    awaitPromise (Promise valueVar) =
+      readMVar valueVar >>= maybe (memoise startedVar rules key) return
+
+-- | A query result that is being computed: 'Nothing' once its computation
+-- has failed, telling the waiters to compute it themselves.
+newtype Promise a = Promise (MVar (Maybe a))
 
 newtype Cyclic f = Cyclic (Some f)
   deriving Show
@@ -221,48 +238,47 @@ memoiseWithCycleDetection
 memoiseWithCycleDetection startedVar depsVar rules =
   rules'
   where
-    rules' (key :: f a) = do
-      maybeEntry <- DHashMap.lookup key <$> readIORef startedVar
-      case maybeEntry of
-        Nothing -> do
-          threadId <- myThreadId
-          valueVar <- newEmptyMVar
-          waitVar <- newMVar $ Just []
-          join $ atomicModifyIORef startedVar $ \started ->
-            case DHashMap.alterLookup (Just . fromMaybe (Started threadId valueVar waitVar)) key started of
-              (Nothing, started') ->
-                ( started'
-                , (do
-                    value <- rules key
-                    join $ modifyMVar waitVar $ \maybeWaitingThreads -> do
-                      case maybeWaitingThreads of
-                        Nothing ->
-                          error "impossible"
+    rules' (key :: f a) =
+      mask $ \restore -> do
+        maybeEntry <- DHashMap.lookup key <$> readIORef startedVar
+        case maybeEntry of
+          Nothing -> do
+            threadId <- myThreadId
+            valueVar <- newEmptyMVar
+            waitVar <- newMVar $ Just []
+            join $ atomicModifyIORef startedVar $ \started ->
+              case DHashMap.alterLookup (Just . fromMaybe (Started threadId valueVar waitVar)) key started of
+                (Nothing, started') ->
+                  ( started'
+                  , do
+                    -- Masked except for the rule itself: however the
+                    -- computation ends, the entry is settled and every thread
+                    -- waiting for it is released. An exception other than
+                    -- 'Cyclic' used to leave the entry started with an empty
+                    -- value, and its waiters blocked forever.
+                    result <- try $ restore $ rules key
+                    uninterruptibleMask_ $ do
+                      waitingThreads <- modifyMVar waitVar $ \maybeWaitingThreads ->
+                        return (Nothing, fromMaybe [] maybeWaitingThreads)
+                      atomicModifyIORef depsVar $ \deps ->
+                        (foldl' (flip HashMap.delete) deps waitingThreads, ())
+                      case result of
+                        Right value -> do
+                          atomicModifyIORef startedVar $ \started'' ->
+                            (DHashMap.insert key (Done value) started'', ())
+                          putMVar valueVar $ Just value
+                        Left (_ :: SomeException) -> do
+                          atomicModifyIORef startedVar $ \started'' ->
+                            (DHashMap.delete key started'', ())
+                          putMVar valueVar Nothing
+                    either throwIO return result
+                  )
 
-                        Just waitingThreads ->
-                          return
-                            ( Nothing
-                            , atomicModifyIORef depsVar $ \deps ->
-                              ( foldl' (flip HashMap.delete) deps waitingThreads
-                              , ()
-                              )
-                            )
-                    atomicModifyIORef startedVar $ \started'' ->
-                      (DHashMap.insert key (Done value) started'', ())
-                    putMVar valueVar $ Just value
-                    return value
-                  ) `catch` \(e :: Cyclic f) -> do
-                    atomicModifyIORef startedVar $ \started'' ->
-                      (DHashMap.delete key started'', ())
-                    putMVar valueVar Nothing
-                    throwIO e
-                )
+                (Just entry, _started') ->
+                  (started, restore $ waitFor entry)
 
-              (Just entry, _started') ->
-                (started, waitFor entry)
-
-        Just entry ->
-          waitFor entry
+          Just entry ->
+            restore $ waitFor entry
       where
         waitFor entry =
           case entry of
