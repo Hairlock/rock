@@ -16,6 +16,9 @@ module Rock.Core where
 import Control.Concurrent.Lifted
 import Control.Exception.Lifted
 import Data.IORef.Lifted
+import qualified Control.Concurrent.MVar as MVar
+import qualified Control.Exception as E
+import qualified Data.IORef as IORef
 import Control.Monad
 import Control.Monad.Base
 import Control.Monad.Cont
@@ -251,14 +254,13 @@ memoiseWithCycleDetection startedVar depsVar rules =
                 (Nothing, started') ->
                   ( started'
                   , do
-                    -- Masked except for the rule itself: however the
+                    -- Masked except for the rule itself, so however the
                     -- computation ends, the entry is settled and every thread
-                    -- waiting for it is released. An exception other than
-                    -- 'Cyclic' used to leave the entry started with an empty
-                    -- value, and its waiters blocked forever.
+                    -- waiting for it is released: an entry left started with
+                    -- no value would block its waiters forever.
                     result <- try $ restore $ rules key
                     uninterruptibleMask_ $ do
-                      waitingThreads <- modifyMVar waitVar $ \maybeWaitingThreads ->
+                      waitingThreads <- liftBase $ MVar.modifyMVar waitVar $ \maybeWaitingThreads ->
                         return (Nothing, fromMaybe [] maybeWaitingThreads)
                       atomicModifyIORef depsVar $ \deps ->
                         (foldl' (flip HashMap.delete) deps waitingThreads, ())
@@ -284,16 +286,20 @@ memoiseWithCycleDetection startedVar depsVar rules =
           case entry of
             Started onThread valueVar waitVar -> do
               threadId <- myThreadId
-              modifyMVar_ waitVar $ \maybeWaitingThreads -> do
+              -- base's modifyMVar_, not the lifted one: lifted-base puts the
+              -- new value before leaving 'restore', so an asynchronous
+              -- exception in that window puts the old value back as well, and
+              -- the next taker's put then blocks forever.
+              liftBase $ MVar.modifyMVar_ waitVar $ \maybeWaitingThreads ->
                 case maybeWaitingThreads of
                   Nothing ->
                     return maybeWaitingThreads
                   Just waitingThreads -> do
-                    join $ atomicModifyIORef depsVar $ \deps -> do
+                    join $ IORef.atomicModifyIORef depsVar $ \deps -> do
                       let deps' = HashMap.insert threadId onThread deps
                       if detectCycle threadId deps' then
                         ( deps
-                        , throwIO $ Cyclic $ Some key
+                        , E.throwIO $ Cyclic $ Some key
                         )
                       else
                         ( deps'

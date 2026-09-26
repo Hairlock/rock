@@ -189,6 +189,36 @@ prop_waiter_recomputes_after_the_computing_thread_dies =
       fmap (either (const Nothing) Just) <$> timeout 5000000 (takeMVar waited)
     outcomes === [Just (Just 42), Just (Just 42)]
 
+-- | Threads computing and waiting for one query, killed at arbitrary points,
+-- leave nothing that blocks a later fetch of it.
+prop_killed_fetches_leave_nothing_blocked :: Property
+prop_killed_fetches_leave_nothing_blocked =
+  withTests 1 $ property $ do
+    stuck <- liftIO $ fmap concat $ forM [0 :: Int .. 299] $ \round_ -> do
+      startedVar <- newIORef mempty
+      depsVar <- newIORef mempty
+      let
+        base :: GenRules Key Key
+        base key_ =
+          case key_ of
+            IntKey i -> do
+              liftIO $ threadDelay 50
+              pure i
+            StringKey s ->
+              pure s
+
+        rules :: Rules Key
+        rules = memoiseWithCycleDetection startedVar depsVar base
+
+      fetchers <- replicateM 4 $ forkIO $ void $ runTask rules $ fetch $ IntKey 1
+      threadDelay (round_ `mod` 97)
+      mapM_ killThread fetchers
+      done <- newEmptyMVar
+      _ <- forkIO $ putMVar done =<< try @SomeException (runTask rules $ fetch $ IntKey 1)
+      outcome <- timeout 5000000 (takeMVar done)
+      pure [round_ | maybe True (either (const True) (/= 1)) outcome]
+    stuck === []
+
 inputRules :: Int -> GenRules (Writer TaskKind Key) Key
 inputRules input (Writer key_) =
   case key_ of
